@@ -1,0 +1,231 @@
+#!/usr/bin/env perl
+
+package main {
+    use strictures;
+    use utf8;
+    use English;
+
+    use feature ":5.36";
+
+    use boolean;
+    use Data::Dumper;
+    use File::Basename;
+    use File::IO;
+    use Getopt::Long qw(GetOptionsFromArray :config gnu_compat);
+    use JSON5;
+    use POSIX;
+    use Return::Type;
+    use Syntax::Keyword::Try;
+    use Types::Standard -all;
+    use Value::TypeCheck;
+
+    use constant {
+        SUCCESS => 0,
+        FAILURE => 1
+    };
+
+    # the global File::IO object variable
+    our $fio = undef;
+    # create our global log filehandle name
+    our $log_fh = undef;
+
+    # global options hash
+    our %options = ();
+
+    our sub construct_daemon :ReturnType(Void) () {
+        # fork from the parent
+        my $pid = undef;
+        $pid = fork();
+
+        # if $pid is undef, forking failed
+        if (! defined $pid ) {
+            say STDERR "Failed to fork process!";
+            exit(FAILURE);
+        }
+
+        # now that we've forked, kill the parent
+        if ($pid > 0) {
+            exit(SUCCESS);
+        }
+
+        # set ourselves as the process leader
+        if (POSIX::setsid == -1) {
+            exit(FAILURE);
+        }
+
+        # for now, ignore the following signals. We'll add a handler for SIGHUP later
+        $SIG{'CHILD'} = 'IGNORE';
+        $SIG{'HUP'}   = 'IGNORE';
+
+        # second fork
+        $pid = undef;
+        $pid = fork();
+        if (! defined $pid) {
+            say STDERR "Failed to fork to abandon controlling TTY";
+            exit(FAILURE);
+        }
+
+        # again, let our parent die
+        if ($pid > 0) {
+            exit(SUCCESS);
+        }
+
+        # set our umask
+        umask(0);
+
+        # now chdir to the root of the filesystem to protect against our
+        # directory disappearing beneath us
+        chdir('/');
+
+        # close our normal filehandles
+        foreach my $fd (*STDIN, *STDOUT, *STDERR) {
+            try {
+                $fio->close($fd);
+            } catch ($e) {
+                say $e;
+                exit(FAILURE);
+            }
+        }
+    }
+
+    sub set_defaults :ReturnType(Void) () {
+        $options{'configFile'}        = '/etc/echod.cfg';
+        $options{'debug'}             = 'false';
+        $options{'logFile'}           = '/var/log/socketd.log';
+        $options{'foreground'}        = 'false';
+        $options{'runas'}             = 'root';
+        $options{'socket'}            = 'FILE:/var/run/socketd.sock';
+        $options{'socketOwner'}       = 'root';
+        $options{'socketGroup'}       = 'root';
+        $options{'socketPermissions'} = 0660;
+    }
+
+    sub process_env_vars :ReturnType(Void) () {
+        if (exists $ENV{'ECHOD_CONFIGFILE'}) {
+            $options{'configFile'} = $ENV{'ECHOD_CONFIGFILE'};
+        }
+        if (exists $ENV{'ECHOD_DEBUG'}) {
+            $options{'debug'}      = $ENV{'ECHOD_DEBUG'};
+        }
+        if (exists $ENV{'ECHOD_LOGFILE'}) {
+            $options{'logfile'}    = $ENV{'ECHOD_LOGFILE'};
+        }
+        if (exists $ENV{'ECHOD_FOREGROUND'}) {
+            $options{'foreground'} = $ENV{'ECHOD_FOREGROUND'};
+        }
+        if (exists $ENV{'ECHOD_SOCKET'}) {
+            $options{'socket'}     = $ENV{'ECHOD_SOCKET'};
+        }
+    }
+
+    sub print_help :ReturnType(Void) () {
+        my $appname = basename $0;
+        say STDOUT "$appname - A simple TCP/IP echo server";
+        say STDOUT "";
+        say STDOUT "OPTIONS:";
+        say STDOUT "  -d|--debug             Enable debug messages";
+        say STDOUT "  -l|--logfile FILEPATH  The full path to the log file";
+        say STDOUT "  -f|--foreground        Whether to run the server in the foreground or background";
+        say STDOUT "  -s|--socket SOCKETPATH The type and socket spec to listen on. This can be a file";
+        say STDOUT "                         or TCP/IP socket to listen on";
+        say STDOUT "  -h|--help              Prints to screen the help message";
+        say STDOUT "  -v|--version           Prints out the version";
+    }
+    sub print_version :ReturnType(Void) () {}
+
+    sub process_cmd_flags :ReturnType(Void) ($args) {
+        type_check($args, ArrayRef);
+        GetOptionsFromArray(
+            $args,
+            'd|debug'       => sub { $options{'debug'} = 'true' },
+            'l|logfile=s'   => \$options{'logFile'},
+            'f|foreground'  => sub { $options{'foreground'} = 'true' },
+            's|socket=s'    => \$options{'socket'},
+            'h|help'        => sub { print_help(); exit 1 },
+            'v|version'     => sub { print_version(); exit 1 }
+        );
+    }
+
+    sub process_config_file :ReturnType(Void) () {
+        if (-f $options{'configFile'}) {
+            my $fio = File::IO->new();
+            my ($c, $fh, $status) = undef;
+            ($fh, $status) = $fio->open('r', $options{'configFile'});
+            ($c, $status)  = $fio->read($fh, -s $fh);
+            $status        = $fio->close($fh);
+
+            # now that we have the content of the JSON5 config file, process it
+            my $config_struct = decode_json5($c);
+            if (exists $config_struct->{'debug'}) {
+                $options{'debug'}             = $config_struct->{'debug'};
+            }
+            if (exists $config_struct->{'logFile'}) {
+                $options{'logFile'}           = $config_struct->{'logFile'};
+            }
+            if (exists $config_struct->{'foreground'}) {
+                $options{'foreground'}        = $config_struct->{'foreground'};
+            }
+            if (exists $config_struct->{'socket'}) {
+                $options{'socket'}            = $config_struct->{'socket'};
+            }
+            if (exists $config_struct->{'socketOwner'}) {
+                $options{'socketOwner'}       = $config_struct->{'socketOwner'};
+            }
+            if (exists $config_struct->{'socketGroup'}) {
+                $options{'socketGroup'}       = $config_struct->{'socketGroup'};
+            }
+            if (exists $config_struct->{'socketPermissions'}) {
+                $options{'socketPermissions'} = $config_struct->{'socketPermissions'};
+            }
+        } # if it doesn't exist, just use the defaults
+    }
+
+    sub process_options :ReturnType(Void) (@args) {
+        type_check(\@args, ArrayRef);
+
+        # options are precedented in the following order:
+        # - defaults
+        # - environment vars
+        # - command line flags
+        # - configuration file
+
+        # first, defaults
+        set_defaults();
+
+        # next, grab any environment vars
+        process_env_vars();
+
+        # now, config file
+        process_config_file();
+
+        # finally, lets get our command line flags. Takes the @ARGV as a ref
+        process_cmd_flags(\@args);
+    }
+
+    sub main :ReturnType(Int) (@args) {
+        type_check(\@args, ArrayRef);
+
+        # first process daemon flags/environment vars/config settings
+        process_options(@args);
+        $fio = File::IO->new();
+        # before we daemonize, create our log filehandle entry
+        say STDERR "OPTIONS: " . Dumper(%options) if $options{'debug'} eq 'true';
+        my ($fh, $status) = $fio->open('a', $options{'logFile'});
+
+        unless ($options{'foreground'} eq 'false') {
+            construct_daemon();
+        }
+
+        my $i = 0;
+#        while (true) {
+#            say STDERR "loop iteration: $i";
+#            $i++;
+#        }
+
+        # before closing, close the log file's filehandle
+        $status = $fio->close($fh);
+        return SUCCESS;
+    }
+
+    main(@ARGV);
+}
